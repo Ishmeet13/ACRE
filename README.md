@@ -509,7 +509,7 @@ A few things that surprised me during development:
 **Ishmeet Singh Arora**
 Master of Applied Computing (AI Specialization) — University of Windsor, graduating December 2025
 
-[GitHub](https://github.com/Ishmeet13) · [LinkedIn](https://linkedin.com/in/ishmeet-singh-arora)
+[GitHub](https://github.com/Ishmeet13) · [LinkedIn](https://www.linkedin.com/in/ishmeetsingharora/)
 
 ---
 
