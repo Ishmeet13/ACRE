@@ -1,0 +1,218 @@
+name: ACRE CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION:        us-east-1
+  ECR_REGISTRY:      ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+  EKS_CLUSTER_NAME:  acre-eks
+
+jobs:
+  # ── Test ────────────────────────────────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB:       acre_test
+          POSTGRES_USER:     acre
+          POSTGRES_PASSWORD: test
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r services/api/requirements.txt
+          pip install -r services/ingestion/requirements.txt
+          pip install -r services/agents/requirements.txt
+          pip install pytest pytest-asyncio pytest-cov httpx
+
+      - name: Run ingestion tests
+        run: pytest services/ingestion/tests/ -v --cov=services/ingestion --cov-report=xml
+        env:
+          POSTGRES_URL: postgresql://acre:test@localhost:5432/acre_test
+          REDIS_URL:    redis://localhost:6379/0
+
+      - name: Run agent tests
+        run: pytest services/agents/tests/ -v --cov=services/agents
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REDIS_URL:      redis://localhost:6379/0
+
+      - name: Run API tests
+        run: pytest services/api/tests/ -v --cov=services/api
+        env:
+          POSTGRES_URL: postgresql://acre:test@localhost:5432/acre_test
+          REDIS_URL:    redis://localhost:6379/0
+          JWT_SECRET:   test_secret
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
+
+  # ── Lint ────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install ruff mypy
+      - name: Ruff lint
+        run: ruff check services/ --select E,W,F,I,N,S --ignore S101,S311
+      - name: Type check API
+        run: mypy services/api --ignore-missing-imports --no-strict-optional
+      - name: TypeScript lint (dashboard)
+        uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - run: |
+          cd dashboard && npm ci
+          npx tsc --noEmit
+          npx eslint src/ --ext .ts,.tsx
+
+  # ── Build & Push Docker Images ───────────────────────────────────────────────
+  build:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        service: [ingestion, agents, api, dashboard]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push ${{ matrix.service }}
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          SERVICE:   ${{ matrix.service }}
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/acre-$SERVICE:$IMAGE_TAG \
+            -t $ECR_REGISTRY/acre-$SERVICE:latest \
+            ./services/$SERVICE
+
+          docker push $ECR_REGISTRY/acre-$SERVICE:$IMAGE_TAG
+          docker push $ECR_REGISTRY/acre-$SERVICE:latest
+
+          echo "IMAGE=$ECR_REGISTRY/acre-$SERVICE:$IMAGE_TAG" >> $GITHUB_ENV
+
+  # ── Deploy to EKS ────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $AWS_REGION
+
+      - name: Substitute image tags in manifests
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          find k8s/ -name "*.yaml" -exec sed -i \
+            "s|<ECR_URL>/acre-|$ECR_REGISTRY/acre-|g" {} \;
+          find k8s/ -name "*.yaml" -exec sed -i \
+            "s|:latest|:$IMAGE_TAG|g" {} \;
+
+      - name: Apply Kubernetes manifests
+        run: kubectl apply -f k8s/ --namespace acre
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/api       --namespace acre --timeout=5m
+          kubectl rollout status deployment/agents    --namespace acre --timeout=5m
+          kubectl rollout status deployment/ingestion --namespace acre --timeout=5m
+
+      - name: Run smoke tests against production
+        run: |
+          API_URL=$(kubectl get service api -n acre -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          curl -f "http://$API_URL/health" || exit 1
+          echo "Smoke test passed: $API_URL"
+
+      - name: Notify Slack on success
+        uses: 8398a7/action-slack@v3
+        if: success()
+        with:
+          status: success
+          text: "ACRE deployed successfully — ${{ github.sha }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Slack on failure
+        uses: 8398a7/action-slack@v3
+        if: failure()
+        with:
+          status: failure
+          text: "ACRE deployment FAILED — ${{ github.sha }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ── Fine-tuning Trigger (weekly on schedule or manual) ─────────────────────
+  finetune:
+    name: Trigger Fine-tuning Job
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule
+    needs: [deploy]
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $AWS_REGION
+
+      - name: Launch fine-tuning K8s Job
+        run: |
+          kubectl delete job finetuning-job -n acre --ignore-not-found
+          kubectl apply -f k8s/finetuning-job.yaml -n acre
+          kubectl wait --for=condition=complete job/finetuning-job -n acre --timeout=4h

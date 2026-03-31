@@ -1,0 +1,59 @@
+# docker-compose.local.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# LOCAL DEV OVERRIDE — runs only infrastructure in Docker.
+# Python services run natively in VSCode for hot-reload and debugging.
+#
+# Usage:
+#   docker compose -f docker-compose.local.yml up -d
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB:       acre
+      POSTGRES_USER:     acre
+      POSTGRES_PASSWORD: acre_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acre"]
+      interval: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  chromadb:
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      ANONYMIZED_TELEMETRY: "false"
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.11.0
+    ports:
+      - "5001:5000"
+    volumes:
+      - mlflow_data:/mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+
+volumes:
+  postgres_data:
+  redis_data:
+  chroma_data:
+  mlflow_data:

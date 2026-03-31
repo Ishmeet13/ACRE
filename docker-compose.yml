@@ -1,0 +1,175 @@
+version: "3.9"
+
+services:
+  # ── Infrastructure ────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: acre
+      POSTGRES_USER: acre
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-acre_dev}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acre"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  chromadb:
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      CHROMA_SERVER_HOST: "0.0.0.0"
+      ANONYMIZED_TELEMETRY: "false"
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.11.0
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_data:/mlflow
+    environment:
+      MLFLOW_BACKEND_STORE_URI: "sqlite:////mlflow/mlflow.db"
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: "/mlflow/artifacts"
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+
+  # ── ACRE Services ─────────────────────────────────────────────────
+  ingestion:
+    build:
+      context: ./services/ingestion
+      dockerfile: Dockerfile
+    environment:
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_URL: postgresql://acre:${POSTGRES_PASSWORD:-acre_dev}@postgres:5432/acre
+      S3_BUCKET: ${S3_BUCKET:-acre-artifacts-local}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+    volumes:
+      - ./services/ingestion:/app
+      - repo_cache:/tmp/repos
+
+  agents:
+    build:
+      context: ./services/agents
+      dockerfile: Dockerfile
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      HF_TOKEN: ${HF_TOKEN}
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_URL: postgresql://acre:${POSTGRES_PASSWORD:-acre_dev}@postgres:5432/acre
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      FINETUNED_MODEL_PATH: ${FINETUNED_MODEL_PATH:-}
+    depends_on:
+      - ingestion
+      - mlflow
+    volumes:
+      - ./services/agents:/app
+      - model_cache:/root/.cache/huggingface
+
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      POSTGRES_URL: postgresql://acre:${POSTGRES_PASSWORD:-acre_dev}@postgres:5432/acre
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-dev_secret_change_in_prod}
+      CELERY_BROKER_URL: redis://redis:6379/1
+      AGENT_SERVICE_URL: http://agents:8080
+      INGESTION_SERVICE_URL: http://ingestion:8080
+    depends_on:
+      - postgres
+      - redis
+      - agents
+    volumes:
+      - ./services/api:/app
+
+  celery_worker:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    command: celery -A app.celery_app worker --loglevel=info -Q ingestion,analysis,patching --concurrency=4
+    environment:
+      POSTGRES_URL: postgresql://acre:${POSTGRES_PASSWORD:-acre_dev}@postgres:5432/acre
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      AGENT_SERVICE_URL: http://agents:8080
+    depends_on:
+      - redis
+      - postgres
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: http://localhost:8000
+      VITE_WS_URL: ws://localhost:8000
+    volumes:
+      - ./dashboard/src:/app/src
+
+  # ── Monitoring ────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+
+volumes:
+  postgres_data:
+  redis_data:
+  chroma_data:
+  mlflow_data:
+  repo_cache:
+  model_cache:
+  prometheus_data:
+  grafana_data:

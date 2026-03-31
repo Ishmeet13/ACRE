@@ -1,0 +1,175 @@
+{
+  "folders": [
+    { "name": "ACRE (root)",     "path": "." },
+    { "name": "API Gateway",     "path": "services/api" },
+    { "name": "Ingestion",       "path": "services/ingestion" },
+    { "name": "Agents",          "path": "services/agents" },
+    { "name": "Fine-tuning",     "path": "services/finetuning" },
+    { "name": "Dashboard",       "path": "dashboard" }
+  ],
+  "settings": {
+    "python.defaultInterpreterPath": "${workspaceFolder:API Gateway}/.venv/bin/python",
+    "python.terminal.activateEnvironment": true,
+    "editor.formatOnSave": true,
+    "editor.rulers": [100],
+    "[python]": {
+      "editor.defaultFormatter": "ms-python.black-formatter"
+    },
+    "[typescript]": {
+      "editor.defaultFormatter": "esbenp.prettier-vscode"
+    },
+    "[typescriptreact]": {
+      "editor.defaultFormatter": "esbenp.prettier-vscode"
+    },
+    "files.exclude": {
+      "**/__pycache__": true,
+      "**/.venv": true,
+      "**/node_modules": true,
+      "**/.pytest_cache": true,
+      "**/*.pyc": true
+    },
+    "search.exclude": {
+      "**/node_modules": true,
+      "**/.venv": true,
+      "**/__pycache__": true
+    },
+    "terminal.integrated.env.osx": {
+      "PYTHONPATH": "${workspaceFolder:API Gateway}"
+    }
+  },
+  "extensions": {
+    "recommendations": [
+      "ms-python.python",
+      "ms-python.black-formatter",
+      "ms-python.pylint",
+      "ms-python.mypy-type-checker",
+      "esbenp.prettier-vscode",
+      "bradlc.vscode-tailwindcss",
+      "ms-azuretools.vscode-docker",
+      "redhat.vscode-yaml",
+      "hashicorp.terraform",
+      "GraphQL.vscode-graphql-syntax",
+      "mtxr.sqltools",
+      "ckolkman.vscode-postgres",
+      "humao.rest-client",
+      "eamodio.gitlens"
+    ]
+  },
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "API Gateway",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "uvicorn",
+        "args": ["main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"],
+        "cwd": "${workspaceFolder:API Gateway}",
+        "python": "${workspaceFolder:API Gateway}/.venv/bin/python",
+        "envFile": "${workspaceFolder:ACRE (root)}/.env",
+        "console": "integratedTerminal"
+      },
+      {
+        "name": "Ingestion Service",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "uvicorn",
+        "args": ["main:app", "--host", "0.0.0.0", "--port", "8080", "--reload"],
+        "cwd": "${workspaceFolder:Ingestion}",
+        "python": "${workspaceFolder:Ingestion}/.venv/bin/python",
+        "envFile": "${workspaceFolder:ACRE (root)}/.env",
+        "console": "integratedTerminal"
+      },
+      {
+        "name": "Agents Service",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "uvicorn",
+        "args": ["main:app", "--host", "0.0.0.0", "--port", "8082", "--reload"],
+        "cwd": "${workspaceFolder:Agents}",
+        "python": "${workspaceFolder:Agents}/.venv/bin/python",
+        "envFile": "${workspaceFolder:ACRE (root)}/.env",
+        "console": "integratedTerminal"
+      },
+      {
+        "name": "Celery Worker",
+        "type": "debugpy",
+        "request": "launch",
+        "module": "celery",
+        "args": ["-A", "celery_tasks", "worker", "--loglevel=info", "-Q", "ingestion,analysis,patching", "--concurrency=2"],
+        "cwd": "${workspaceFolder:API Gateway}",
+        "python": "${workspaceFolder:API Gateway}/.venv/bin/python",
+        "envFile": "${workspaceFolder:ACRE (root)}/.env",
+        "console": "integratedTerminal"
+      }
+    ],
+    "compounds": [
+      {
+        "name": "All Services",
+        "configurations": ["API Gateway", "Ingestion Service", "Agents Service", "Celery Worker"]
+      }
+    ]
+  },
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "Docker: Start Infrastructure",
+        "type": "shell",
+        "command": "docker compose up -d postgres redis chromadb mlflow",
+        "group": "build",
+        "presentation": { "reveal": "always", "panel": "new" }
+      },
+      {
+        "label": "Docker: Start All",
+        "type": "shell",
+        "command": "docker compose up -d",
+        "group": "build"
+      },
+      {
+        "label": "Docker: Stop All",
+        "type": "shell",
+        "command": "docker compose down",
+        "group": "build"
+      },
+      {
+        "label": "Docker: Reset (wipe volumes)",
+        "type": "shell",
+        "command": "docker compose down -v",
+        "group": "build"
+      },
+      {
+        "label": "Install: API deps",
+        "type": "shell",
+        "command": "cd services/api && python -m venv .venv && .venv/bin/pip install -r requirements.txt"
+      },
+      {
+        "label": "Install: Ingestion deps",
+        "type": "shell",
+        "command": "cd services/ingestion && python -m venv .venv && .venv/bin/pip install -r requirements.txt"
+      },
+      {
+        "label": "Install: Agents deps",
+        "type": "shell",
+        "command": "cd services/agents && python -m venv .venv && .venv/bin/pip install -r requirements.txt"
+      },
+      {
+        "label": "Install: Dashboard deps",
+        "type": "shell",
+        "command": "cd dashboard && npm install"
+      },
+      {
+        "label": "Run: Dashboard (dev)",
+        "type": "shell",
+        "command": "cd dashboard && npm run dev",
+        "group": "build",
+        "presentation": { "reveal": "always", "panel": "new" }
+      },
+      {
+        "label": "Test API",
+        "type": "shell",
+        "command": "cd services/api && .venv/bin/pytest tests/ -v"
+      }
+    ]
+  }
+}

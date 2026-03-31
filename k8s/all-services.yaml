@@ -1,0 +1,436 @@
+# ═══════════════════════════════════════════════════════════════
+# ACRE Kubernetes Manifests
+# Apply with: kubectl apply -f k8s/
+# ═══════════════════════════════════════════════════════════════
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: acre
+  labels:
+    app: acre
+
+---
+# ── ConfigMap ─────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: acre-config
+  namespace: acre
+data:
+  MLFLOW_TRACKING_URI:      "http://mlflow:5000"
+  CHROMA_HOST:              "chromadb"
+  CHROMA_PORT:              "8000"
+  REDIS_URL:                "redis://redis:6379/0"
+  SANDBOX_IMAGE:            "python:3.11-slim"
+  SANDBOX_TIMEOUT_S:        "30"
+  LOG_LEVEL:                "INFO"
+
+---
+# ── Secret (values injected by CI/CD via Sealed Secrets or AWS Secrets Manager)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: acre-secrets
+  namespace: acre
+type: Opaque
+# In real deployment, manage via:
+#   kubectl create secret generic acre-secrets \
+#     --from-literal=OPENAI_API_KEY=... \
+#     --from-literal=GITHUB_TOKEN=... \
+#     --from-literal=POSTGRES_URL=...
+data: {}  # base64 encoded values go here
+
+---
+# ═══ Ingestion Service ══════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion
+  namespace: acre
+  labels:
+    app: ingestion
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ingestion
+  template:
+    metadata:
+      labels:
+        app: ingestion
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "8080"
+    spec:
+      containers:
+        - name: ingestion
+          image: <ECR_URL>/acre-ingestion:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: acre-config
+            - secretRef:
+                name: acre-secrets
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          volumeMounts:
+            - name: repo-cache
+              mountPath: /tmp/repos
+      volumes:
+        - name: repo-cache
+          emptyDir:
+            sizeLimit: "10Gi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingestion
+  namespace: acre
+spec:
+  selector:
+    app: ingestion
+  ports:
+    - port: 8080
+      targetPort: 8080
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ingestion-hpa
+  namespace: acre
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ingestion
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+---
+# ═══ Agents Service ═════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agents
+  namespace: acre
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: agents
+  template:
+    metadata:
+      labels:
+        app: agents
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "8080"
+    spec:
+      containers:
+        - name: agents
+          image: <ECR_URL>/acre-agents:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: acre-config
+            - secretRef:
+                name: acre-secrets
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "2Gi"
+            limits:
+              cpu: "4000m"
+              memory: "8Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          volumeMounts:
+            - name: model-cache
+              mountPath: /root/.cache/huggingface
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agents
+  namespace: acre
+spec:
+  selector:
+    app: agents
+  ports:
+    - port: 8080
+      targetPort: 8080
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: agents-hpa
+  namespace: acre
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: agents
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+
+---
+# ═══ API Gateway ════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: acre
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: <ECR_URL>/acre-api:latest
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: acre-config
+            - secretRef:
+                name: acre-secrets
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 15
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: acre
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 80
+      targetPort: 8000
+  type: LoadBalancer
+
+---
+# ═══ Celery Workers ═════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-worker
+  namespace: acre
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: celery-worker
+  template:
+    metadata:
+      labels:
+        app: celery-worker
+    spec:
+      containers:
+        - name: celery-worker
+          image: <ECR_URL>/acre-api:latest
+          command:
+            - celery
+            - -A
+            - app.celery_app
+            - worker
+            - --loglevel=info
+            - -Q
+            - ingestion,analysis,patching
+            - --concurrency=4
+          envFrom:
+            - configMapRef:
+                name: acre-config
+            - secretRef:
+                name: acre-secrets
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+
+---
+# ═══ Fine-tuning Worker (on-demand Job) ═════════════════════════
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: finetuning-job
+  namespace: acre
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: finetuning
+          image: <ECR_URL>/acre-finetuning:latest
+          command: ["python", "train.py", "--epochs", "3"]
+          envFrom:
+            - configMapRef:
+                name: acre-config
+            - secretRef:
+                name: acre-secrets
+          resources:
+            requests:
+              cpu: "4000m"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+              memory: "32Gi"
+          volumeMounts:
+            - name: model-output
+              mountPath: /finetuned_model
+      volumes:
+        - name: model-output
+          persistentVolumeClaim:
+            claimName: finetuned-model-pvc
+      nodeSelector:
+        node.kubernetes.io/instance-type: "g4dn.xlarge"  # GPU node on AWS
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+---
+# ═══ Persistent Volume Claims ════════════════════════════════════
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-cache-pvc
+  namespace: acre
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: efs-sc  # AWS EFS for shared model cache
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: finetuned-model-pvc
+  namespace: acre
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+# ═══ Ingress ════════════════════════════════════════════════════
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: acre-ingress
+  namespace: acre
+  annotations:
+    kubernetes.io/ingress.class: "alb"
+    alb.ingress.kubernetes.io/scheme: "internet-facing"
+    alb.ingress.kubernetes.io/target-type: "ip"
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/certificate-arn: "<ACM_CERT_ARN>"
+spec:
+  rules:
+    - host: api.acre.yourdomain.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
+    - host: app.acre.yourdomain.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dashboard
+                port:
+                  number: 3000

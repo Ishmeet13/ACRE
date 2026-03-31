@@ -1,0 +1,35 @@
+# Python virtual environments
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+.pytest_cache/
+
+# Node
+dashboard/node_modules/
+dashboard/dist/
+
+# Environment — never commit secrets
+.env
+.env.local
+
+# Mac
+.DS_Store
+**/.DS_Store
+
+# Large model files
+*.bin
+*.safetensors
+*.gguf
+services/finetuning/finetuned_model/
+
+# MLflow local data
+mlflow/mlruns/
+mlflow/*.db
+
+# Repo cache
+/tmp/repos/
+
+# Docker volumes
+postgres_data/
+redis_data/
